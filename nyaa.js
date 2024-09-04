@@ -1,257 +1,169 @@
- import AbstractSource from './abstract.js'
 
- const QUALITIES = ['1080', '720', '540', '480']
 
-  padleft a variable with 0 ex: 1 => '01'
- function zeropad (v = 1, l = 2) {
-   return (typeof v === 'string' ? v : v.toString()).padStart(l, '0')
- }
+const QUALITIES = ['1080', '720', '540', '480']
 
- const epstring = ep => `"E${zeropad(ep)}+"|"E${zeropad(ep)}v"|"+${zeropad(ep)}+"|"+${zeropad(ep)}v"`
-  [EO]?[-EPD _—]\d{2}(?:[-v _.—]|$)
-  /[EO]?[-EPD]\d{2}(?:[-v.]|$)|[EO]?[EPD ]\d{2}(?:[v .]|$)|[EO]?[EPD_]\d{2}(?:[v_.]|$)|[EO]?[EPD—]\d{2}(?:[v.—]|$)|\d{2} ?[-~—] ?\d{2}/i
-  matches: OP01 ED01 EP01 E01 01v 01. -01- _01_ with spaces and stuff
- const epNumRx = /[EO]?[-EPD]\d{2}(?:[-v.]|$)|[EO]?[EPD ]\d{2}(?:[v .]|$)|[EO]?[EPD_]\d{2}(?:[v_.]|$)|[EO]?[EPD—]\d{2}(?:[v.—]|$)|\d{2} ?[-~—] ?\d{2}/i
+const ANY = 'e*|a*|r*|i*|o*'
 
-  create an array of potentially valid titles from a given media
- function createTitle (_titles) {
-    group and de-duplicate
-   const grouped = [
-     ...new Set(
-       _titles.filter(name => name != null && name.length > 3)
-     )
-   ]
-   const titles = []
-   const appendTitle = t => {
-      replace & with encoded
-     const title = t.replace(/&/g, '%26').replace(/\?/g, '%3F').replace(/#/g, '%23')
-     titles.push(title)
+let sneedex = []
+const sneedexPromise = (async () => {
+  try {
+    const res = await fetch('https://sneedex.moe/api/public/nyaa')
+    /** @type {{nyaaIDs: number[]}[]} */
+    const json = await res.json()
+    sneedex = json.flatMap(({ nyaaIDs }) => nyaaIDs).sort((a, b) => a - b) // sort for binary search
+  } catch (e) {}
+})()
 
-      replace Season 2 with S2, else replace 2nd Season with S2, but keep the original title
-     const match1 = title.match(/(\d)(?:nd|rd|th) Season/i)
-     const match2 = title.match(/Season (\d)/i)
+function binarySearch (arr, el) {
+  let left = 0
+  let right = arr.length - 1
 
-     if (match2) {
-       titles.push(title.replace(/Season \d/i, `S${match2[1]}`))
-     } else if (match1) {
-       titles.push(title.replace(/(\d)(?:nd|rd|th) Season/i, `S${match1[1]}`))
-     }
-   }
-   for (const t of grouped) {
-     appendTitle(t)
-     if (t.includes('-')) appendTitle(t.replaceAll('-', ''))
-   }
-   return titles
- }
+  while (left <= right) {
+    // Using bitwise or instead of Math.floor as it is slightly faster
+    const mid = ((right + left) / 2) | 0
+    if (arr[mid] === el) {
+      return true
+    } else if (el < arr[mid]) {
+      right = mid - 1
+    } else {
+      left = mid + 1
+    }
+  }
 
- function findEdge (media, type, formats = ['TV', 'TV_SHORT'], skip) {
-   let res = media.relations.edges.find(edge => {
-     if (edge.relationType === type) {
-       return formats.includes(edge.node.format)
-     }
-     return false
-   })
-    this is hit-miss
-   if (!res && !skip && type === 'SEQUEL') res = findEdge(media, type, formats = ['TV', 'TV_SHORT', 'OVA'], true)
-   return res
- }
+  return false
+}
 
- function getMediaMaxEp (media, playable) {
-   if (playable) {
-     return media.nextAiringEpisode?.episode - 1 || media.airingSchedule?.nodes?.[0]?.episode - 1 || media.episodes
-   } else {
-     return media.episodes || media.nextAiringEpisode?.episode - 1 || media.airingSchedule?.nodes?.[0]?.episode - 1
-   }
- }
+/**
+ * @param {string=} id
+ * @param {string=} link
+ * @returns {boolean}
+ */
+function onSneedex (id, link) {
+  if (id && id !== '?' && binarySearch(sneedex, id)) return true
+  // nyaa url /view/digits
+  const match = link?.match(/\d+/i)
+  if (match && binarySearch(sneedex, Number(match[0]))) return true
+  return false
+}
+export default class AbstractSource {
+  name = 'Missing name'
+  description = 'No description provided'
+  /** @type {import('./types.js').Accuracy} */
+  accuracy = 'Low'
+  /** @type {import('./types.js').Config} */
+  config = {}
 
- function parseRSSNodes (nodes) {
-   return nodes.map(item => {
-     const pubDate = item.querySelector('pubDate')?.textContent
+  /**
+   * Gets results for single episode
+   * @type {import('./types.js').SearchFunction}
+   */
+  single (options) {
+    throw new Error('Source doesn\'t implement single')
+  }
 
-     return {
-       title: item.querySelector('title')?.textContent || '?',
-       link: item.querySelector('enclosure')?.attributes.url.value || item.querySelector('link')?.textContent || '?',
-       seeders: item.querySelector('seeders')?.textContent ?? '?',
-       leechers: item.querySelector('leechers')?.textContent ?? '?',
-       downloads: item.querySelector('downloads')?.textContent ?? '?',
-       size: item.querySelector('size')?.textContent ?? '?',
-       date: pubDate && new Date(pubDate)
-     }
-   })
- }
+  /**
+   * Gets results for batch of episodes
+   * @type {import('./types.js').SearchFunction}
+   */
+  batch (options) {
+    throw new Error('Source doesn\'t implement batch')
+  }
 
- /**
-    *
-    * @param {{ media:any, episode?:number, force?:boolean, increment?:boolean, offset?: number, rootMedia?:any }} opts
-    * @returns
-    */
- async function resolveSeason (opts) {
-    media, episode, increment, offset, force
-   if (!opts.media || !(opts.episode || opts.force)) throw new Error('No episode or media for season resolve!')
+  /**
+   * Gets results for a movie
+   * @type {import('./types.js').SearchFunction}
+   */
+  movie (options) {
+    throw new Error('Source doesn\'t implement movie')
+  }
+}
 
-   let { media, episode, increment, offset = 0, rootMedia = opts.media, force } = opts
+export default new class Tosho extends AbstractSource {
+  name = 'AnimeTosho'
+  description = 'Anime Tosho is a free, completely automated service which mirrors most anime torrents. Provides high accuracy searches.'
+  /** @type {import('./types.js').Accuracy} */
+  accuracy = 'High'
 
-   const rootHighest = (rootMedia.nextAiringEpisode?.episode || rootMedia.episodes)
+  url = atob('aHR0cHM6Ly9mZWVkLmFuaW1ldG9zaG8ub3JnL2pzb24=')
 
-   const prequel = !increment && findEdge(media, 'PREQUEL')?.node
-   const sequel = !prequel && (increment || increment == null) && findEdge(media, 'SEQUEL')?.node
-   const edge = prequel || sequel
-   increment = increment ?? !prequel
+  buildQuery ({ resolution, exclusions }) {
+    let query = `&qx=1&q=!("${exclusions.join('"|"')}")`
+    if (resolution) {
+      query += `((${ANY}|"${resolution}") !"${QUALITIES.filter(q => q !== resolution).join('" !"')}")`
+    } else {
+      query += ANY // HACK: tosho NEEDS a search string, so we lazy search a single common vowel
+    }
 
-   if (!edge) {
-     return { media, episode: episode - offset, offset, increment, rootMedia, failed: true }
-   }
-   media = (await this.getAnimeById(edge.id)).data.Media
+    return query
+  }
 
-   const highest = media.nextAiringEpisode?.episode || media.episodes
+  /**
+   * @param {import('./types.js').Tosho[]} entries
+   * @param {boolean} batch
+   * @returns {import('./types.js').Result[]}
+   **/
+  map (entries, batch = false) {
+    return entries.map(entry => {
+      return {
+        title: entry.title || entry.torrent_name,
+        link: entry.magnet_uri,
+        seeders: (entry.seeders || 0) >= 30000 ? 0 : entry.seeders || 0,
+        leechers: (entry.leechers || 0) >= 30000 ? 0 : entry.leechers || 0,
+        downloads: entry.torrent_downloaded_count || 0,
+        hash: entry.info_hash,
+        size: entry.total_size,
+        verified: !!entry.anidb_fid,
+        type: onSneedex(entry.nyaa_id, entry.torrent_url || entry.article_url || entry.website_url) ? 'alt' : batch ? 'batch' : undefined,
+        date: new Date(entry.timestamp * 1000)
+      }
+    })
+  }
 
-   const diff = episode - (highest + offset)
-   offset += increment ? rootHighest : highest
-   if (increment) rootMedia = media
+  /** @type {import('./types.js').SearchFunction} */
+  async single ({ anidbEid, resolution, exclusions }) {
+    if (!anidbEid) throw new Error('No anidbEid provided')
+    const query = this.buildQuery({ resolution, exclusions })
+    const res = await fetch(this.url + '?eid=' + anidbEid + query)
 
-    force marches till end of tree, no need for checks
-   if (!force && diff <= rootHighest) {
-     episode -= offset
-     return { media, episode, offset, increment, rootMedia }
-   }
+    /** @type {import('./types.js').Tosho[]} */
+    const data = await res.json()
 
-   return resolveSeason({ media, episode, increment, offset, rootMedia, force })
- }
+    await sneedexPromise
+    if (data.length) return this.map(data)
+    // TODO: this shouldn't really be required anymore? test.
+    if (resolution) return this.single({ anidbEid, exclusions }) // some releases like dvd might be in weird resolutions like 540p
+    return []
+  }
 
- const DOMPARSER = (typeof DOMParser !== 'undefined') && DOMParser.prototype.parseFromString.bind(new DOMParser())
+  /** @type {import('./types.js').SearchFunction} */
+  async batch ({ anidbAid, resolution, episodeCount, exclusions }) {
+    if (!anidbAid) throw new Error('No anidbAid provided')
+    if (episodeCount == null) throw new Error('No episodeCount provided')
+    const query = this.buildQuery({ resolution, exclusions })
+    const res = await fetch(this.url + '?order=size-d&aid=' + anidbAid + query)
 
- async function getRSSContent (url) {
-   if (!url) return null
-   try {
-     const res = await fetch(url)
-     if (!res.ok) {
-       throw new Error('Failed fetching RSS!\n' + res.statusText)
-     }
-     return DOMPARSER(await res.text(), 'text/xml')
-   } catch (e) {
-     throw new Error('Failed fetching RSS!\n' + e.message)
-   }
- }
+    const data = /** @type {import('./types.js').Tosho[]} */(await res.json()).filter(entry => entry.num_files >= episodeCount)
 
- export default new class Nyaa extends AbstractSource {
-   name = 'Nyaa'
-   description = 'Nyaa is a public, closed tracker. Offers no good API or searches, and its searches are generally low accuracy, and very slow.'
-   /** @type {import('./types.js').Accuracy} */
-   accuracy = 'Low'
+    await sneedexPromise
+    if (data.length) return this.map(data, true)
+    // TODO: this shouldn't really be required anymore? test.
+    if (resolution) return this.batch({ anidbAid, episodeCount, exclusions }) // some releases like dvd might be in weird resolutions like 540p
+    return []
+  }
 
-   /**
-    * @param {import('./types.js').Tosho[]} entries
-    * @param {boolean} batch
-    * @returns {import('./types.js').Result[]}
-    **/
-   map (entries, batch = false) {
-     return []
-   }
+  /** @type {import('./types.js').SearchFunction} */
+  async movie ({ anidbAid, resolution, exclusions }) {
+    if (!anidbAid) throw new Error('No anidbAid provided')
+    const query = this.buildQuery({ resolution, exclusions })
+    const res = await fetch(this.url + '?aid=' + anidbAid + query)
 
-   /** @type {import('./types.js').SearchFunction} */
-   async single ({ media, episode, exclusions, resolution }) {/
-      mode cuts down on the amt of queries made 'check' || 'batch'
-     const titles = createTitle(media).join(')|(')
+    /** @type {import('./types.js').Tosho[]} */
+    const data = await res.json()
 
-     const prequel = findEdge(media, 'PREQUEL')?.node
-     const sequel = findEdge(media, 'SEQUEL')?.node
-     const isBatch = media.status === 'FINISHED' && media.episodes !== 1
-
-      if media has multiple seasons, and this S is > 1, then get the absolute episode number of the episode
-     const absolute = prequel && !mode && (await resolveSeason({ media, episode, force: true }))
-     const absoluteep = absolute?.offset + episode
-     const episodes = [episode]
-
-      only use absolute episode number if its smaller than max episodes this series has, ex:
-      looking for E1 of S2, S1 has 12 ep and S2 has 13, absolute will be 13
-      so this would find the 13th ep of the 2nd season too if this check wasnt here
-     if (absolute && absoluteep < (getMediaMaxEp(media) || episode)) {
-       episodes.push(absoluteep)
-     }
-
-     let ep = ''
-     if (media.episodes !== 1 && mode !== 'batch') {
-       if (isBatch) {
-         const digits = Math.max(2, Math.log(media.episodes) * Math.LOG10E + 1 | 0)
-         ep = `"${zeropad(1, digits)}-${zeropad(media.episodes, digits)}"|"${zeropad(1, digits)}~${zeropad(media.episodes, digits)}"|"Batch"|"Complete"|"${zeropad(episode)}+"|"${zeropad(episode)}v"`
-       } else {
-         ep = `(${episodes.map(epstring).join('|')})`
-       }
-     }
-
-     const excl = exclusions.join('|')
-     const quality = (!ignoreQuality && (`"${resolution}"` || '"1080"')) || ''
-     const url = new URL(`${''}/?page=rss&c=1_2&f=0&s=seeders&o=desc&q=(${titles})${ep}${quality}-(${excl})`)
-
-     let nodes = [...(await getRSSContent(url)).querySelectorAll('item')]
-
-     if (absolute) {
-      if this is S > 1 aka absolute ep number exists get entries for S1title + absoluteEP
-      the reason this isnt done with recursion like sequelEntries is because that would include the S1 media dates
-      we want the dates of the target media as the S1 title might be used for SX releases
-       const titles = createTitle(absolute.media).join(')|(')
-
-       const url = new URL(`${''}/?page=rss&c=1_2&f=0&s=seeders&o=desc&q=(${titles})${epstring(absoluteep)}${quality}-(${excl})`)
-       nodes = [...nodes, ...(await getRSSContent(url)).querySelectorAll('item')]
-     }
-
-     let entries = parseRSSNodes(nodes)
-
-     const checkSequelDate = media.status === 'FINISHED' && (sequel?.status === 'FINISHED' || sequel?.status === 'RELEASING') && sequel.startDate
-
-     const sequelStartDate = checkSequelDate && new Date(Object.values(checkSequelDate).join(' '))
-
-      recursive, get all entries for media sequel, and its sequel, and its sequel
-     const sequelEntries =
-       (sequel?.status === 'FINISHED' || sequel?.status === 'RELEASING') &&
-         (await this.single({ media: (await anilistClient.searchIDSingle({ id: sequel.id })).data.Media, episode, mode: mode || 'check' }))
-
-     const checkPrequelDate = (media.status === 'FINISHED' || media.status === 'RELEASING') && prequel?.status === 'FINISHED' && prequel?.endDate
-
-     const prequelEndDate = checkPrequelDate && new Date(Object.values(checkPrequelDate).join(' '))
-
-      1 month in MS, a bit of jitter for pre-releases and releasers being late as fuck, lets hope it doesnt cause issues
-     const month = 2674848460
-
-     if (prequelEndDate) {
-       entries = entries.filter(entry => entry.date > new Date(+prequelEndDate + month))
-     }
-
-     if (sequelStartDate && media.format === 'TV') {
-       entries = entries.filter(entry => entry.date < new Date(+sequelStartDate - month))
-     }
-
-     if (sequelEntries?.length) {
-       if (mode === 'check') {
-         entries = [...entries, ...sequelEntries]
-       } else {
-         entries = entries.filter(entry => !sequelEntries.find(sequel => sequel.link === entry.link))
-       }
-     }
-
-      this gets entries without any episode limiting, and for batches
-     const batchEntries = !mode && isBatch && (await this.single({ media, episode, ignoreQuality, mode: 'batch' })).filter(entry => {
-       return !epNumRx.test(entry.title)
-     })
-
-     if (batchEntries?.length) {
-       entries = [...entries, ...batchEntries]
-     }
-
-      some archaic shows only have shit DVD's in weird qualities, so try to look up without any quality restrictions when there are no results
-     if (!entries.length && !ignoreQuality && !mode) {
-       entries = await this.single({ media, episode, ignoreQuality: true })
-     }
-     return []
-   }
-
-   /** @type {import('./types.js').SearchFunction} */
-   async batch (opts) {
-     return []
-   }
-
-   /** @type {import('./types.js').SearchFunction} */
-   async movie (opts) {
-     return []
-   }
- }()
+    await sneedexPromise
+    if (data.length) return this.map(data, true)
+    // TODO: this shouldn't really be required anymore? test.
+    if (resolution) return this.movie({ anidbAid, exclusions }) // some releases like dvd might be in weird resolutions like 540p
+    return []
+  }
+}()
